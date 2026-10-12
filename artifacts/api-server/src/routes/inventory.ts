@@ -1,0 +1,400 @@
+import { Router } from "express";
+import { db } from "@workspace/db";
+import {
+  inventoryTable,
+  inventoryAdjustmentsTable,
+  inventoryMovementsTable,
+  materialsTable,
+  inventoryLocationsTable,
+  salesWorkOrdersTable,
+  usersTable,
+} from "@workspace/db";
+import { and, eq, desc } from "@workspace/db";
+import { paginateQuery, paginatedResponse } from "../lib/pagination";
+import { PROTECTED_VAULT_ITEM_NAMES } from "../lib/ensureDefaultVaultItems";
+import { isCoreProductMasterItem } from "../lib/coreProductMaster";
+
+const router = Router();
+
+const normalizeUom = (unit: unknown) => {
+  const value = String(unit ?? "").trim();
+  return value.toLowerCase() === "l" ? "Litres" : value;
+};
+
+function requireAuth(req: any, res: any, next: any) {
+  if (!(req.session as any)?.userId)
+    return res.status(401).json({ error: "Not authenticated" });
+  next();
+}
+
+// List inventory (unified product catalog with stock levels)
+router.get("/", requireAuth, async (req, res) => {
+  const [rows, workOrders] = await Promise.all([
+    db
+      .select({
+        inv: inventoryTable,
+        material: materialsTable,
+        locationName: inventoryLocationsTable.locationName,
+      })
+      .from(inventoryTable)
+      .innerJoin(
+        materialsTable,
+        eq(inventoryTable.materialId, materialsTable.id),
+      )
+      .leftJoin(
+        inventoryLocationsTable,
+        eq(inventoryTable.locationId, inventoryLocationsTable.id),
+      )
+      .orderBy(materialsTable.name),
+    db.select().from(salesWorkOrdersTable),
+  ]);
+  const reservedByMaterial = new Map<number, number>();
+  for (const workOrder of workOrders) {
+    if (
+      ["Completed", "Cancelled", "Rejected"].includes(String(workOrder.status))
+    )
+      continue;
+    const requirements = Array.isArray(workOrder.materialRequirements)
+      ? workOrder.materialRequirements
+      : [];
+    for (const requirement of requirements as any[]) {
+      const materialId = Number(requirement.materialId);
+      const quantity = Number(requirement.requiredQuantity || 0) || 0;
+      if (materialId)
+        reservedByMaterial.set(
+          materialId,
+          (reservedByMaterial.get(materialId) || 0) + quantity,
+        );
+    }
+  }
+
+  let data = rows.map((r) => ({
+    id: r.inv.id,
+    materialId: r.material.id,
+    materialName: r.material.name,
+    isProtected: PROTECTED_VAULT_ITEM_NAMES.has(
+      r.material.name.trim().toLowerCase(),
+    ),
+    sku: r.material.sku,
+    category: r.material.category,
+    categoryId: r.material.categoryId,
+    attributeValues: r.material.attributeValues,
+    unit: normalizeUom(r.material.unit),
+    quantityOnHand: Number(r.inv.quantityOnHand),
+    reservedQuantity: Math.min(
+      Math.max(0, Number(r.inv.quantityOnHand)),
+      reservedByMaterial.get(Number(r.material.id)) || 0,
+    ),
+    availableQuantity: Math.max(
+      0,
+      Number(r.inv.quantityOnHand) -
+        (reservedByMaterial.get(Number(r.material.id)) || 0),
+    ),
+    locationId: r.inv.locationId,
+    locationName: r.locationName ?? null,
+    costBasis: r.inv.costBasis !== null ? Number(r.inv.costBasis) : null,
+    buyPricePerUnit:
+      r.material.buyPricePerUnit !== null
+        ? Number(r.material.buyPricePerUnit)
+        : null,
+    sellPricePerUnit:
+      r.material.sellPricePerUnit !== null
+        ? Number(r.material.sellPricePerUnit)
+        : null,
+    hsnSac: r.material.hsnSac,
+    gstPercent:
+      r.material.gstPercent !== null ? Number(r.material.gstPercent) : 0,
+    itemType: r.material.itemType,
+    criticalLevel:
+      r.material.criticalLevel !== null
+        ? Number(r.material.criticalLevel)
+        : null,
+    imageUrl: r.material.imageUrl,
+    qrCode: r.material.qrCode,
+    lastUpdated: r.inv.lastUpdated,
+  }));
+  if (String(req.query.coreOnly || "").toLowerCase() === "true")
+    data = data.filter((row) => isCoreProductMasterItem(row.materialName));
+  if (String(req.query.excludeVaultManaged || "").toLowerCase() === "true")
+    data = data.filter(
+      (row) =>
+        row.sku !== "VLT-FP-SPAWN" &&
+        row.sku !== "VLT-FP-CASING-SOIL" &&
+        row.sku !== "VLT-RM-GROW-BAG" &&
+        row.sku !== "VLT-EXT-SPAWN" &&
+        row.sku !== "VLT-EXT-CASING-SOIL" &&
+        row.sku !== "VLT-EXT-GROW-BAG",
+    );
+  const search = String(req.query.search || "")
+    .trim()
+    .toLowerCase();
+  if (search)
+    data = data.filter((row) =>
+      [row.materialName, row.sku, row.category, row.locationName].some(
+        (value) =>
+          String(value || "")
+            .toLowerCase()
+            .includes(search),
+      ),
+    );
+  if (req.query.skip === undefined && req.query.limit === undefined)
+    return res.json(data);
+  const pagination = paginateQuery(req.query);
+  return res.json(
+    paginatedResponse(
+      data.slice(pagination.skip, pagination.skip + pagination.limit),
+      data.length,
+      pagination,
+    ),
+  );
+});
+
+// Adjust inventory stock
+router.post("/", requireAuth, async (req, res) => {
+  const userId = (req.session as any).userId;
+  const { materialId, locationId, quantityDelta, reason, reference, notes } =
+    req.body;
+
+  // Validate material exists
+  const [material] = await db
+    .select()
+    .from(materialsTable)
+    .where(eq(materialsTable.id, materialId))
+    .limit(1);
+  if (!material) return res.status(400).json({ error: "Material not found" });
+
+  // Upsert inventory record
+  const existing = await db
+    .select()
+    .from(inventoryTable)
+    .where(eq(inventoryTable.materialId, materialId))
+    .limit(1);
+
+  let inv;
+  if (existing.length > 0) {
+    const newQty = Number(existing[0].quantityOnHand) + Number(quantityDelta);
+    [inv] = await db
+      .update(inventoryTable)
+      .set({ quantityOnHand: String(newQty), lastUpdated: new Date() })
+      .where(eq(inventoryTable.id, existing[0].id))
+      .returning();
+  } else {
+    [inv] = await db
+      .insert(inventoryTable)
+      .values({
+        materialId,
+        locationId: locationId ?? null,
+        quantityOnHand: String(quantityDelta),
+      })
+      .returning();
+  }
+
+  // Log adjustment
+  await db.insert(inventoryAdjustmentsTable).values({
+    materialId,
+    locationId: locationId ?? null,
+    quantityDelta: String(quantityDelta),
+    reason,
+    reference: reference ?? null,
+    notes: notes ?? null,
+    adjustedByUserId: userId,
+  });
+
+  return res.status(201).json({
+    id: inv.id,
+    materialId: material.id,
+    materialName: material.name,
+    sku: material.sku,
+    category: material.category,
+    unit: normalizeUom(material.unit),
+    quantityOnHand: Number(inv.quantityOnHand),
+    locationId: inv.locationId,
+    lastUpdated: inv.lastUpdated,
+  });
+});
+
+// List the complete stock ledger: manual adjustments and inter-location transfers.
+router.get("/movements", requireAuth, async (req, res) => {
+  const [transferRows, adjustmentRows, locations] = await Promise.all([
+    db
+      .select({
+        mov: inventoryMovementsTable,
+        materialName: materialsTable.name,
+        unit: materialsTable.unit,
+        createdByName: usersTable.displayName,
+      })
+      .from(inventoryMovementsTable)
+      .innerJoin(
+        materialsTable,
+        eq(inventoryMovementsTable.materialId, materialsTable.id),
+      )
+      .leftJoin(
+        usersTable,
+        eq(inventoryMovementsTable.createdByUserId, usersTable.id),
+      ),
+    db
+      .select({
+        adjustment: inventoryAdjustmentsTable,
+        materialName: materialsTable.name,
+        unit: materialsTable.unit,
+        createdByName: usersTable.displayName,
+      })
+      .from(inventoryAdjustmentsTable)
+      .innerJoin(
+        materialsTable,
+        eq(inventoryAdjustmentsTable.materialId, materialsTable.id),
+      )
+      .leftJoin(
+        usersTable,
+        eq(inventoryAdjustmentsTable.adjustedByUserId, usersTable.id),
+      ),
+    db.select().from(inventoryLocationsTable),
+  ]);
+  const locationNames = new Map(
+    locations.map((location: any) => [location.id, location.locationName]),
+  );
+  let data = [
+    ...transferRows.map((row: any) => ({
+      id: `transfer-${row.mov.id}`,
+      materialId: row.mov.materialId,
+      materialName: row.materialName,
+      unit: normalizeUom(row.unit),
+      type: "transfer",
+      fromLocationId: row.mov.fromLocationId,
+      fromLocationName: locationNames.get(row.mov.fromLocationId) ?? null,
+      toLocationId: row.mov.toLocationId,
+      toLocationName: locationNames.get(row.mov.toLocationId) ?? null,
+      quantityKg: Math.abs(Number(row.mov.quantityKg)),
+      reason: row.mov.reason,
+      reference: row.mov.reason,
+      notes: row.mov.notes,
+      createdByName: row.createdByName ?? null,
+      createdAt: row.mov.createdAt,
+    })),
+    ...adjustmentRows.map((row: any) => {
+      const quantity = Number(row.adjustment.quantityDelta);
+      const locationName = locationNames.get(row.adjustment.locationId) ?? null;
+      return {
+        id: `adjustment-${row.adjustment.id}`,
+        materialId: row.adjustment.materialId,
+        materialName: row.materialName,
+        unit: normalizeUom(row.unit),
+        type: quantity < 0 ? "outward" : "inward",
+        fromLocationId: quantity < 0 ? row.adjustment.locationId : null,
+        fromLocationName: quantity < 0 ? locationName : null,
+        toLocationId: quantity < 0 ? null : row.adjustment.locationId,
+        toLocationName: quantity < 0 ? null : locationName,
+        quantityKg: Math.abs(quantity),
+        reason: row.adjustment.reason,
+        reference: row.adjustment.reference ?? null,
+        notes: row.adjustment.notes,
+        createdByName: row.createdByName ?? null,
+        createdAt: row.adjustment.createdAt,
+      };
+    }),
+  ].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+  );
+  const search = String(req.query.search || "")
+    .trim()
+    .toLowerCase();
+  if (search)
+    data = data.filter((row) =>
+      [
+        row.materialName,
+        row.reason,
+        row.reference,
+        row.notes,
+        row.createdByName,
+      ].some((value) =>
+        String(value || "")
+          .toLowerCase()
+          .includes(search),
+      ),
+    );
+  if (req.query.skip === undefined && req.query.limit === undefined)
+    return res.json(data);
+  const pagination = paginateQuery(req.query);
+  return res.json(
+    paginatedResponse(
+      data.slice(pagination.skip, pagination.skip + pagination.limit),
+      data.length,
+      pagination,
+    ),
+  );
+});
+
+// Create inventory movement (transfer between locations)
+router.post("/movements", requireAuth, async (req, res) => {
+  const userId = (req.session as any).userId;
+  const {
+    materialId,
+    fromLocationId,
+    toLocationId,
+    quantityKg,
+    reason,
+    notes,
+  } = req.body;
+
+  const [material] = await db
+    .select()
+    .from(materialsTable)
+    .where(eq(materialsTable.id, materialId))
+    .limit(1);
+  if (!material) return res.status(400).json({ error: "Material not found" });
+  const sourceId = Number(fromLocationId);
+  const destinationId = Number(toLocationId);
+  const quantity = Number(quantityKg);
+  if (!Number.isSafeInteger(Number(materialId)) || Number(materialId) <= 0)
+    return res.status(400).json({ error: "A valid material is required" });
+  if (!Number.isSafeInteger(sourceId) || sourceId <= 0 || !Number.isSafeInteger(destinationId) || destinationId <= 0)
+    return res.status(400).json({ error: "Source and destination warehouses are required" });
+  if (sourceId === destinationId)
+    return res.status(400).json({ error: "Source and destination warehouses must differ" });
+  if (!Number.isFinite(quantity) || quantity <= 0)
+    return res.status(400).json({ error: "Transfer quantity must be greater than zero" });
+
+  let mov: any;
+  try {
+    mov = await db.transaction(async (tx) => {
+      const sourceInventory = (await tx.select().from(inventoryTable)
+        .where(and(eq(inventoryTable.materialId, Number(materialId)), eq(inventoryTable.locationId, sourceId))))[0];
+      if (!sourceInventory || Number(sourceInventory.quantityOnHand) < quantity)
+        throw Object.assign(new Error("Insufficient stock at the source warehouse"), { status: 409 });
+      const destinationInventory = (await tx.select().from(inventoryTable)
+        .where(and(eq(inventoryTable.materialId, Number(materialId)), eq(inventoryTable.locationId, destinationId))))[0];
+      const [updatedSource] = await tx.update(inventoryTable)
+        .set({ quantityOnHand: String(Number(sourceInventory.quantityOnHand) - quantity), lastUpdated: new Date() })
+        .where(eq(inventoryTable.id, sourceInventory.id)).returning();
+      if (destinationInventory) {
+        await tx.update(inventoryTable)
+          .set({ quantityOnHand: String(Number(destinationInventory.quantityOnHand) + quantity), lastUpdated: new Date() })
+          .where(eq(inventoryTable.id, destinationInventory.id));
+      } else {
+        await tx.insert(inventoryTable).values({ materialId: Number(materialId), locationId: destinationId, quantityOnHand: String(quantity) });
+      }
+      const [created] = await tx.insert(inventoryMovementsTable).values({
+        materialId: Number(materialId), fromLocationId: sourceId, toLocationId: destinationId,
+        quantityKg: String(quantity), reason: reason ?? null, notes: notes ?? null, createdByUserId: userId,
+      }).returning();
+      return { ...created, sourceQuantityOnHand: Number(updatedSource.quantityOnHand) };
+    });
+  } catch (error: any) {
+    return res.status(error.status || 500).json({ error: error.message || "Unable to transfer stock" });
+  }
+
+  return res.status(201).json({
+    id: mov.id,
+    materialId: mov.materialId,
+    materialName: material.name,
+    fromLocationId: mov.fromLocationId,
+    toLocationId: mov.toLocationId,
+    quantityKg: Number(mov.quantityKg),
+    reason: mov.reason,
+    notes: mov.notes,
+    createdAt: mov.createdAt,
+    sourceQuantityOnHand: mov.sourceQuantityOnHand,
+  });
+});
+
+export default router;

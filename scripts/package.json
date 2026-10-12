@@ -1,0 +1,33 @@
+{
+  "name": "@workspace/scripts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "local:data:seed": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env --import tsx ./src/seed-local-manual.ts",
+    "test:yugam-parity": "node --require ./tsx-windows.cjs --import tsx ./test/yugam-parity.ts",
+    "test:local-data": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env --import tsx ./test/local-manual-data.ts",
+    "test:crew": "node --require ./tsx-windows.cjs --import tsx ./test/crew-regressions.ts",
+    "test:crew:browser": "node --require ./tsx-windows.cjs --import tsx ./test/crew-browser-runner.mjs",
+    "hello": "tsx ./src/hello.ts",
+    "demo:data:seed": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env.demo --import tsx ./src/mushroom-production-data.ts seed --confirm-production",
+    "demo:data:clear": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env.demo --import tsx ./src/mushroom-production-data.ts clear --confirm-production",
+    "staging:data:seed": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env.staging --import tsx ./src/mushroom-production-data.ts seed --confirm-production",
+    "staging:data:clear": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env.staging --import tsx ./src/mushroom-production-data.ts clear --confirm-production",
+    "production:data:seed": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env.production --import tsx ./src/mushroom-production-data.ts seed --confirm-production",
+    "production:data:clear": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env.production --import tsx ./src/mushroom-production-data.ts clear --confirm-production",
+    "development:uploads:migrate": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env --import tsx ./src/migrate-upload-root.ts",
+    "staging:uploads:migrate": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env.staging --import tsx ./src/migrate-upload-root.ts",
+    "production:uploads:migrate": "node --require ./tsx-windows.cjs --env-file=../artifacts/api-server/.env.production --import tsx ./src/migrate-upload-root.ts",
+    "migrate:mongodb": "tsx ./migrate-postgresql-to-mongodb.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@workspace/db": "workspace:*",
+    "@types/node": "catalog:",
+    "@types/pg": "^8.20.0",
+    "mongoose": "^8.19.4",
+    "pg": "^8.22.0",
+    "tsx": "catalog:"
+  }
+}

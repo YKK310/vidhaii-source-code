@@ -1,0 +1,491 @@
+import { Router } from "express";
+import { db } from "@workspace/db";
+import {
+  chambersTable,
+  chamberReadingsTable,
+  locationsTable,
+  batchesTable,
+  usersTable,
+} from "@workspace/db";
+import { and, eq, desc } from "@workspace/db";
+import { organizationId } from "../lib/access";
+import { chronologyError, resolveProductionDateTime } from "../lib/productionDateTime";
+
+const router = Router();
+const ANNUR_CHAMBER_TYPES = new Set([
+  "pre_wetting",
+  "bunker_1",
+  "bunker_2",
+  "bunker_3",
+  "bunker_4",
+  "bulk",
+]);
+
+function numericValue(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const raw =
+    typeof value === "object" && "$numberDecimal" in value
+      ? (value as { $numberDecimal: unknown }).$numberDecimal
+      : value;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function requireAuth(req: any, res: any, next: any) {
+  if (!(req.session as any)?.userId)
+    return res.status(401).json({ error: "Not authenticated" });
+  next();
+}
+
+// List chambers
+router.get("/", requireAuth, async (req, res) => {
+  const { locationId } = req.query as Record<string, string | undefined>;
+
+  const rows = await db
+    .select({
+      chamber: chambersTable,
+      locationCode: locationsTable.code,
+      currentBatchCode: batchesTable.batchCode,
+      currentBatchStage: batchesTable.currentStage,
+      currentBatchStartedAt: batchesTable.casingSoilStartedAt,
+    })
+    .from(chambersTable)
+    .innerJoin(locationsTable, eq(chambersTable.locationId, locationsTable.id))
+    .leftJoin(batchesTable, eq(chambersTable.currentBatchId, batchesTable.id))
+    .where(eq(chambersTable.organizationId, organizationId(req)));
+
+  let filtered = rows;
+  if (locationId)
+    filtered = filtered.filter(
+      (r) => String(r.chamber.locationId) === locationId,
+    );
+
+  return res.json(
+    filtered.map((r) => ({
+      id: r.chamber.id,
+      name: r.chamber.name,
+      locationId: r.chamber.locationId,
+      locationCode: r.locationCode,
+      chamberType: r.chamber.chamberType,
+      status: r.chamber.status,
+      capacity: r.chamber.capacity,
+      currentBatchId: r.chamber.currentBatchId,
+      currentBatchCode: r.currentBatchCode ?? null,
+      currentBatchStage: r.currentBatchStage ?? null,
+      currentBatchStartedAt: r.currentBatchStartedAt ?? null,
+      lastTemperature:
+        r.chamber.lastTemperature !== null
+          ? numericValue(r.chamber.lastTemperature)
+          : null,
+      lastNh3: numericValue(r.chamber.lastNh3),
+      lastCo2: numericValue(r.chamber.lastCo2),
+      lastMoisture:
+        numericValue(r.chamber.lastMoisture),
+      currentTurnNumber: r.chamber.currentTurnNumber,
+      lastReadingAt: r.chamber.lastReadingAt,
+      lengthM: numericValue(r.chamber.lengthM),
+      widthM: numericValue(r.chamber.widthM),
+      heightM: numericValue(r.chamber.heightM),
+      notes: r.chamber.notes,
+    })),
+  );
+});
+
+// Create chamber
+router.post("/", requireAuth, async (req, res) => {
+  const {
+    name,
+    locationId,
+    chamberType,
+    capacity,
+    lengthM,
+    widthM,
+    heightM,
+    notes,
+  } = req.body;
+  const [location] = await db
+    .select()
+    .from(locationsTable)
+    .where(eq(locationsTable.id, Number(locationId)))
+    .limit(1);
+  if (!location) return res.status(400).json({ error: "Location not found" });
+  if (location.code === "A" && !ANNUR_CHAMBER_TYPES.has(String(chamberType)))
+    return res.status(400).json({ error: "Select a valid Annur chamber type" });
+  if (location.code === "C" && chamberType !== "casing_soil")
+    return res.status(400).json({
+      error: "Coimbatore chambers must use the Casing Soil Chamber type",
+    });
+
+  const [chamber] = await db
+    .insert(chambersTable)
+    .values({
+      organizationId: organizationId(req),
+      name,
+      locationId,
+      chamberType: chamberType ?? "bulk",
+      status: "idle",
+      capacity: capacity ?? null,
+      lengthM: lengthM ?? null,
+      widthM: widthM ?? null,
+      heightM: heightM ?? null,
+      notes: notes ?? null,
+    })
+    .returning();
+
+  const [loc] = await db
+    .select()
+    .from(locationsTable)
+    .where(eq(locationsTable.id, locationId))
+    .limit(1);
+  return res.status(201).json({ ...chamber, locationCode: loc?.code ?? "" });
+});
+
+// Get chamber detail
+router.get("/:id", requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  const [row] = await db
+    .select({
+      chamber: chambersTable,
+      locationCode: locationsTable.code,
+      currentBatchCode: batchesTable.batchCode,
+      currentBatchStage: batchesTable.currentStage,
+      currentBatchStartedAt: batchesTable.casingSoilStartedAt,
+    })
+    .from(chambersTable)
+    .innerJoin(locationsTable, eq(chambersTable.locationId, locationsTable.id))
+    .leftJoin(batchesTable, eq(chambersTable.currentBatchId, batchesTable.id))
+    .where(
+      and(
+        eq(chambersTable.id, id),
+        eq(chambersTable.organizationId, organizationId(req)),
+      ),
+    )
+    .limit(1);
+
+  if (!row) return res.status(404).json({ error: "Chamber not found" });
+
+  const readings = await db
+    .select()
+    .from(chamberReadingsTable)
+    .where(
+      and(
+        eq(chamberReadingsTable.chamberId, id),
+        eq(chamberReadingsTable.organizationId, organizationId(req)),
+      ),
+    )
+    .orderBy(desc(chamberReadingsTable.recordedAt))
+    .limit(20);
+
+  return res.json({
+    id: row.chamber.id,
+    name: row.chamber.name,
+    locationId: row.chamber.locationId,
+    locationCode: row.locationCode,
+    chamberType: row.chamber.chamberType,
+    status: row.chamber.status,
+    capacity: row.chamber.capacity,
+    currentBatchId: row.chamber.currentBatchId,
+    currentBatchCode: row.currentBatchCode ?? null,
+    currentBatchStage: row.currentBatchStage ?? null,
+    currentBatchStartedAt: row.currentBatchStartedAt ?? null,
+    lastTemperature:
+      row.chamber.lastTemperature !== null
+        ? numericValue(row.chamber.lastTemperature)
+        : null,
+    lastNh3: numericValue(row.chamber.lastNh3),
+    lastCo2: numericValue(row.chamber.lastCo2),
+    lastMoisture:
+      row.chamber.lastMoisture !== null
+        ? numericValue(row.chamber.lastMoisture)
+        : null,
+    currentTurnNumber: row.chamber.currentTurnNumber,
+    lastReadingAt: row.chamber.lastReadingAt,
+    lengthM: numericValue(row.chamber.lengthM),
+    widthM: numericValue(row.chamber.widthM),
+    heightM: numericValue(row.chamber.heightM),
+    notes: row.chamber.notes,
+    recentReadings: readings,
+  });
+});
+
+// Update chamber
+router.patch("/:id", requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  const {
+    name,
+    chamberType,
+    status,
+    capacity,
+    currentBatchId,
+    lengthM,
+    widthM,
+    heightM,
+    notes,
+  } = req.body;
+  const [existing] = await db
+    .select()
+    .from(chambersTable)
+    .where(
+      and(
+        eq(chambersTable.id, id),
+        eq(chambersTable.organizationId, organizationId(req)),
+      ),
+    )
+    .limit(1);
+  if (!existing) return res.status(404).json({ error: "Chamber not found" });
+  if (
+    existing.chamberType === "casing_soil" &&
+    existing.currentBatchId &&
+    ((status !== undefined && status !== existing.status) ||
+      (currentBatchId !== undefined &&
+        Number(currentBatchId) !== Number(existing.currentBatchId)) ||
+      (chamberType !== undefined && chamberType !== existing.chamberType))
+  ) {
+    return res.status(409).json({
+      error:
+        "This chamber is reserved for an active casing-soil batch and cannot be released or reassigned manually",
+    });
+  }
+  const [location] = await db
+    .select()
+    .from(locationsTable)
+    .where(eq(locationsTable.id, existing.locationId))
+    .limit(1);
+  if (
+    chamberType !== undefined &&
+    location?.code === "A" &&
+    !ANNUR_CHAMBER_TYPES.has(String(chamberType))
+  )
+    return res.status(400).json({
+      error: "Legacy Turn chambers cannot be assigned to new production",
+    });
+
+  if (
+    chamberType !== undefined &&
+    location?.code === "C" &&
+    chamberType !== "casing_soil"
+  )
+    return res.status(400).json({
+      error: "Coimbatore chambers must use the Casing Soil Chamber type",
+    });
+  const updates: Record<string, any> = {};
+  if (name !== undefined) updates.name = name;
+  if (chamberType !== undefined) updates.chamberType = chamberType;
+  if (status !== undefined) updates.status = status;
+  if (capacity !== undefined) updates.capacity = capacity;
+  if (currentBatchId !== undefined) updates.currentBatchId = currentBatchId;
+  if (lengthM !== undefined) updates.lengthM = lengthM;
+  if (widthM !== undefined) updates.widthM = widthM;
+  if (heightM !== undefined) updates.heightM = heightM;
+  if (notes !== undefined) updates.notes = notes;
+
+  const [updated] = await db
+    .update(chambersTable)
+    .set(updates)
+    .where(
+      and(
+        eq(chambersTable.id, id),
+        eq(chambersTable.organizationId, organizationId(req)),
+      ),
+    )
+    .returning();
+  if (!updated) return res.status(404).json({ error: "Chamber not found" });
+
+  const [loc] = await db
+    .select()
+    .from(locationsTable)
+    .where(eq(locationsTable.id, updated.locationId))
+    .limit(1);
+  return res.json({ ...updated, locationCode: loc?.code ?? "" });
+});
+
+// Delete chamber
+router.delete("/:id", requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  const [existing] = await db
+    .select()
+    .from(chambersTable)
+    .where(
+      and(
+        eq(chambersTable.id, id),
+        eq(chambersTable.organizationId, organizationId(req)),
+      ),
+    )
+    .limit(1);
+  if (!existing) return res.status(404).json({ error: "Chamber not found" });
+  if (existing.status === "active" || existing.currentBatchId)
+    return res
+      .status(409)
+      .json({ error: "An occupied chamber cannot be deleted" });
+  await db
+    .delete(chambersTable)
+    .where(
+      and(
+        eq(chambersTable.id, id),
+        eq(chambersTable.organizationId, organizationId(req)),
+      ),
+    );
+  return res.status(204).send();
+});
+
+// Get chamber readings
+router.get("/:id/readings", requireAuth, async (req, res) => {
+  const chamberId = Number(req.params.id);
+  const rows = await db
+    .select({
+      reading: chamberReadingsTable,
+      chamberName: chambersTable.name,
+      recordedByName: usersTable.displayName,
+      batchCode: batchesTable.batchCode,
+      batchStatus: batchesTable.status,
+      batchStage: batchesTable.currentStage,
+    })
+    .from(chamberReadingsTable)
+    .innerJoin(
+      chambersTable,
+      eq(chamberReadingsTable.chamberId, chambersTable.id),
+    )
+    .leftJoin(
+      usersTable,
+      eq(chamberReadingsTable.recordedByUserId, usersTable.id),
+    )
+    .leftJoin(batchesTable, eq(chamberReadingsTable.batchId, batchesTable.id))
+    .where(
+      and(
+        eq(chamberReadingsTable.chamberId, chamberId),
+        eq(chamberReadingsTable.organizationId, organizationId(req)),
+      ),
+    )
+    .orderBy(desc(chamberReadingsTable.recordedAt));
+
+  return res.json(
+    rows.map((r) => ({
+      id: r.reading.id,
+      chamberId: r.reading.chamberId,
+      chamberName: r.chamberName,
+      batchId: r.reading.batchId,
+      turnNumber: r.reading.turnNumber,
+      batchCode: r.batchCode ?? null,
+      batchStatus: r.batchStatus ?? null,
+      batchStage: r.batchStage ?? null,
+      temperatureCelsius:
+        r.reading.temperatureCelsius !== null
+          ? numericValue(r.reading.temperatureCelsius)
+          : null,
+      nh3Ppm: numericValue(r.reading.nh3Ppm),
+      co2Percent:
+        numericValue(r.reading.co2Percent),
+      humidity: numericValue(r.reading.humidity),
+      notes: r.reading.notes,
+      recordedAt: r.reading.recordedAt,
+      recordedByName: r.recordedByName ?? "System",
+    })),
+  );
+});
+
+// Add chamber reading
+router.post("/:id/readings", requireAuth, async (req, res) => {
+  const chamberId = Number(req.params.id);
+  const userId = (req.session as any).userId;
+  const { temperatureCelsius, nh3Ppm, co2Percent, humidity, notes, recordedAt } = req.body;
+
+  const [chamber] = await db
+    .select()
+    .from(chambersTable)
+    .where(
+      and(
+        eq(chambersTable.id, chamberId),
+        eq(chambersTable.organizationId, organizationId(req)),
+      ),
+    )
+    .limit(1);
+  if (!chamber) return res.status(404).json({ error: "Chamber not found" });
+  const readingTime = resolveProductionDateTime(recordedAt);
+  if (!readingTime)
+    return res.status(400).json({ error: "Reading date and time is invalid" });
+  if (chamber.currentBatchId) {
+    const [activeBatch] = await db.select().from(batchesTable).where(eq(batchesTable.id, chamber.currentBatchId)).limit(1);
+    const error = chronologyError(
+      readingTime,
+      activeBatch?.stageEnteredAt ?? activeBatch?.initializedAt,
+      "Reading date and time",
+    );
+    if (error) return res.status(400).json({ error });
+  }
+  const [location] = await db
+    .select()
+    .from(locationsTable)
+    .where(eq(locationsTable.id, chamber.locationId))
+    .limit(1);
+  const isCasingSoil =
+    location?.code === "C" && chamber.chamberType === "casing_soil";
+  if (isCasingSoil) {
+    if (chamber.status !== "active" || !chamber.currentBatchId)
+      return res.status(409).json({
+        error:
+          "Assign an active casing-soil batch stage before logging readings",
+      });
+    for (const [label, value] of [
+      ["Temperature", temperatureCelsius],
+      ["NH3", nh3Ppm],
+      ["CO2", co2Percent],
+      ["Moisture", humidity],
+    ] as const) {
+      if (
+        value !== "" &&
+        value !== null &&
+        value !== undefined &&
+        !Number.isFinite(Number(value))
+      )
+        return res
+          .status(400)
+          .json({ error: `${label} must be a valid number when entered` });
+    }
+  }
+
+  const [reading] = await db
+    .insert(chamberReadingsTable)
+    .values({
+      organizationId: organizationId(req),
+      chamberId,
+      // Keep every reading tied to the batch occupying the chamber.  Annur
+      // batch history and chamber history then read the same durable record.
+      batchId: chamber.currentBatchId ?? null,
+      turnNumber: isCasingSoil ? chamber.currentTurnNumber : null,
+      temperatureCelsius: temperatureCelsius ?? null,
+      nh3Ppm: nh3Ppm ?? null,
+      co2Percent: co2Percent ?? null,
+      humidity: humidity ?? null,
+      notes: notes ?? null,
+      recordedAt: readingTime,
+      recordedByUserId: userId,
+    })
+    .returning();
+
+  // Update chamber's last reading
+  const updates: Record<string, any> = { lastReadingAt: readingTime };
+  if (temperatureCelsius !== undefined)
+    updates.lastTemperature = temperatureCelsius;
+  if (nh3Ppm !== undefined) updates.lastNh3 = nh3Ppm;
+  if (co2Percent !== undefined) updates.lastCo2 = co2Percent;
+  if (humidity !== undefined) updates.lastMoisture = humidity;
+  await db
+    .update(chambersTable)
+    .set(updates)
+    .where(
+      and(
+        eq(chambersTable.id, chamberId),
+        eq(chambersTable.organizationId, organizationId(req)),
+      ),
+    );
+
+  const interval = new Date(reading.recordedAt);
+  interval.setMinutes(0, 0, 0);
+  return res.status(201).json({
+    ...reading,
+    chamberName: chamber.name,
+    expectedLogTime: interval.toISOString(),
+  });
+});
+
+export default router;

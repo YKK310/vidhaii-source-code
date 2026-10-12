@@ -1,0 +1,226 @@
+import { toast } from "sonner";
+import { responseError, getErrorMessage } from "./errorMessage";
+import React, { createContext, useContext, useEffect, useState } from "react";
+import { useGetMe, User } from "@workspace/api-client-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { restoreAccessToken, setAccessToken } from "./authTokens";
+interface AuthContextType {
+  user: User | null;
+  isLoading: boolean;
+  login: (user: User, accessToken?: string) => void;
+  logout: () => void;
+  permissions: string[];
+  enabledModuleKeys: string[];
+  isSuperAdmin: boolean;
+  isModuleEnabled: (moduleKey: string) => boolean;
+  can: (permission: string) => boolean;
+  hasScopedPermission: (
+    moduleKey: string,
+    submoduleKey: string | null | undefined,
+    action?: string,
+  ) => boolean;
+  refreshPermissions: () => Promise<void>;
+}
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+const normalizePermission = (value: string) => {
+  const key = value.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+  const parts = key.split(".");
+  const action = parts.pop() ?? "";
+  const aliases: Record<string, string> = {
+    edit: "update",
+    forown: "for_own",
+    forothers: "for_others",
+    changetime: "change_time",
+    settings: "manage_settings",
+  };
+  return [...parts, aliases[action.replaceAll("_", "")] ?? action].join(".");
+};
+const buildScopedPermissionKey = (
+  moduleKey: string,
+  submoduleKey: string | null | undefined,
+  action = "view",
+) =>
+  normalizePermission(
+    [moduleKey, submoduleKey, action].filter(Boolean).join("."),
+  );
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const queryClient = useQueryClient();
+  const [user, setUser] = useState<User | null>(null),
+    [loggedOut, setLoggedOut] = useState(false),
+    [sessionRestored, setSessionRestored] = useState(false),
+    [permissions, setPermissions] = useState<string[]>([]),
+    [permissionsUserId, setPermissionsUserId] = useState<number | null>(null),
+    [enabledModuleKeys, setEnabledModuleKeys] = useState<string[]>(["ledger"]),
+    [isSuperAdmin, setIsSuperAdmin] = useState(false),
+    [permissionsLoading, setPermissionsLoading] = useState(false);
+  const { data: meData, isLoading: meLoading, isError, error: meError } = useGetMe({
+    query: { queryKey: ["/api/auth/me"], enabled: sessionRestored },
+  });
+  useEffect(() => {
+    const base = String(import.meta.env.VITE_API_BASE || "")
+      .replace(/\/+$/, "")
+      .replace(/\/api$/, "");
+    let cancelled = false;
+    let retryTimer: number | undefined;
+    let attempts = 0;
+    const restore = async () => {
+      const result = await restoreAccessToken(base);
+      // When the browser opens while the local/server API is still booting,
+      // keep the existing httpOnly refresh session and retry briefly. This
+      // avoids treating a connection failure as a user-initiated logout.
+      if (result.unavailable && attempts < 5 && !cancelled) {
+        attempts += 1;
+        retryTimer = window.setTimeout(restore, 1000);
+        return;
+      }
+      if (!cancelled) setSessionRestored(true);
+    };
+    void restore();
+    return () => {
+      cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+    };
+  }, []);
+  useEffect(() => {
+    if (meData && !isError) setUser(meData);
+    else if (isError && (meError as any)?.status === 401) setUser(null);
+  }, [meData, isError, meError]);
+  useEffect(() => {
+    const expired = () => logout();
+    window.addEventListener("auth:expired", expired);
+    return () => window.removeEventListener("auth:expired", expired);
+  }, []);
+  const refreshPermissions = async () => {
+    if (!user) {
+      setPermissions([]);
+      return;
+    }
+    setPermissionsLoading(true);
+    try {
+      const base = import.meta.env.BASE_URL?.replace(/\/$/, "") ?? "";
+      const response = await fetch(`${base}/api/permissions/me`, {
+        credentials: "include",
+      });
+      if (!response.ok) throw await responseError(response, "Unable to load your permissions");
+      const data = await response.json();
+      setPermissions(
+        Array.isArray(data.permissions)
+          ? data.permissions.map(normalizePermission)
+          : [],
+      );
+      setIsSuperAdmin(data.isSuperAdmin === true);
+      setEnabledModuleKeys(
+        Array.isArray(data.enabledModuleKeys)
+          ? data.enabledModuleKeys
+          : ["ledger"],
+      );
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Unable to load your permissions"));
+      setPermissions([]);
+      setIsSuperAdmin(false);
+      setEnabledModuleKeys(["ledger"]);
+    } finally {
+      setPermissionsUserId(Number(user.id));
+      setPermissionsLoading(false);
+    }
+  };
+  useEffect(() => {
+    void refreshPermissions();
+  }, [user]);
+  const login = (newUser: User, token?: string) => {
+    if (token) setAccessToken(token);
+    setLoggedOut(false);
+    queryClient.setQueryData(["/api/auth/me"], newUser);
+    setUser(newUser);
+  };
+  const logout = () => {
+    setAccessToken(null);
+    queryClient.setQueryData(["/api/auth/me"], null);
+    setLoggedOut(true);
+    setUser(null);
+    setPermissions([]);
+    setPermissionsUserId(null);
+    setIsSuperAdmin(false);
+    setEnabledModuleKeys(["ledger"]);
+  };
+  const isLoading =
+    !sessionRestored ||
+    meLoading ||
+    permissionsLoading ||
+    (!!user && permissionsUserId !== Number(user.id)) ||
+    (!loggedOut && !!meData && !isError && user === null);
+  const can = (permission: string) =>
+    (permission === "crew.attendance.view" && Boolean((user as any)?.employeeId)) ||
+    permissions.includes("*") ||
+    permissions.includes(normalizePermission(permission));
+  const isModuleEnabled = (moduleKey: string) =>
+    enabledModuleKeys.includes(moduleKey);
+  const hasScopedPermission = (
+    moduleKey: string,
+    submoduleKey: string | null | undefined,
+    action = "view",
+  ) => {
+    const key = buildScopedPermissionKey(moduleKey, submoduleKey, action);
+    if (can(key)) return true;
+    if (key === "crew.attendance.for_own") return can("crew.attendance_own");
+    if (key === "crew.attendance.for_others")
+      return can("crew.attendance_others");
+    return false;
+  };
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        isLoading,
+        login,
+        logout,
+        permissions,
+        enabledModuleKeys,
+        isSuperAdmin,
+        isModuleEnabled,
+        can,
+        hasScopedPermission,
+        refreshPermissions,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (!context) throw new Error("useAuth must be used within an AuthProvider");
+  return context;
+}
+export function usePermission() {
+  const { user, isSuperAdmin } = useAuth();
+  const isAdmin = isSuperAdmin;
+  const locationScope: string[] = Array.isArray((user as any)?.locationScope)
+    ? (user as any).locationScope
+    : [];
+  const hasAll = isAdmin || locationScope.includes("cross_site");
+  function can(
+    action: "view" | "create" | "approve" | "delete",
+    location?: string,
+  ): boolean {
+    if (!user) return false;
+    if (isAdmin) return true;
+    if (action === "delete") return false;
+    if (action === "approve") {
+      if (user.role !== "manager" && !isSuperAdmin) return false;
+      return !location
+        ? hasAll || locationScope.length > 0
+        : hasAll || locationScope.includes(location);
+    }
+    if (action === "create") {
+      if (user.role === "viewer") return false;
+      return !location
+        ? hasAll || locationScope.length > 0
+        : hasAll || locationScope.includes(location);
+    }
+    return !location
+      ? hasAll || locationScope.length > 0
+      : hasAll || locationScope.includes(location);
+  }
+  return { isAdmin, can, locationScope, role: user?.role ?? null };
+}

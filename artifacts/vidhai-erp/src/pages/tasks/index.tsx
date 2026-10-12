@@ -1,0 +1,1142 @@
+import { useEffect, useState } from "react";
+import { DataPagination } from "@/components/ui/data-pagination";
+import { useClientPagination } from "@/hooks/use-client-pagination";
+import {
+  useCreateTask,
+  useDeleteTask,
+  useListBatches,
+  useUpdateTask,
+} from "@workspace/api-client-react";
+import {
+  keepPreviousData,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { Shell } from "@/components/layout/Shell";
+import { useAuth } from "@/lib/auth";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  CheckSquare,
+  ChevronDown,
+  ChevronRight,
+  ClipboardList,
+  Clock3,
+  MoreVertical,
+  Pause,
+  Pencil,
+  Play,
+  Plus,
+  SquareCheckBig,
+  Trash2,
+  UserRoundPlus,
+} from "lucide-react";
+import { toast } from "sonner";
+
+const STATUS_OPTIONS = [
+  {
+    value: "todo",
+    label: "To Do",
+    color: "bg-slate-100 text-slate-700 border-slate-200",
+  },
+  {
+    value: "in_progress",
+    label: "Start",
+    color: "bg-blue-50 text-blue-700 border-blue-200",
+  },
+  {
+    value: "paused",
+    label: "Pause",
+    color: "bg-amber-50 text-amber-700 border-amber-200",
+  },
+  {
+    value: "done",
+    label: "Complete",
+    color: "bg-green-50 text-green-700 border-green-200",
+  },
+  {
+    value: "cancelled",
+    label: "Cancelled",
+    color: "bg-red-50 text-red-700 border-red-200",
+  },
+];
+const FILTER_OPTIONS = [
+  { value: "all", label: "All" },
+  { value: "start", label: "Start" },
+  { value: "pause", label: "Pause" },
+  { value: "complete", label: "Complete" },
+];
+const PRIORITIES = ["low", "medium", "high", "urgent"];
+const emptyForm = {
+  title: "",
+  description: "",
+  batchRef: "",
+  priority: "medium",
+  estimatedMinutes: "",
+  notes: "",
+};
+
+type Crew = {
+  id: number;
+  name: string;
+  employeeCode: string;
+  designation?: string;
+  userId?: number | null;
+};
+type Assignment = {
+  employeeId: number;
+  employeeName: string;
+  employeeCode?: string;
+  userId?: number | null;
+};
+type TaskRow = Record<string, any> & {
+  assignments?: Assignment[];
+  activeTimers?: any[];
+  actualMinutes?: number;
+};
+type Timesheet = {
+  entries: any[];
+  totals: {
+    employeeMinutes: number;
+    daily: Record<string, number>;
+    tasks: Record<string, number>;
+  };
+};
+
+async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`/api${path}`, {
+    credentials: "include",
+    ...init,
+    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+  });
+  const data = response.status === 204 ? null : await response.json();
+  if (!response.ok) throw new Error(data?.error || "Request failed");
+  return data as T;
+}
+const formatMinutes = (value: number) => {
+  const numeric = Number(value);
+  const total = Number.isFinite(numeric) ? Math.max(0, Math.round(numeric)) : 0;
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+};
+const entryDurationMinutes = (entry: any) => {
+  const stored = Number(entry.durationMinutes);
+  if (Number.isFinite(stored) && stored >= 0) return stored;
+  const start = new Date(entry.startTime).getTime();
+  const end = entry.endTime ? new Date(entry.endTime).getTime() : Date.now();
+  return Number.isFinite(start) && Number.isFinite(end)
+    ? Math.max(0, (end - start) / 60_000)
+    : 0;
+};
+const formatDateTime = (value?: string | null) =>
+  value
+    ? new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "medium",
+      }).format(new Date(value))
+    : "—";
+const formatTimesheetTime = (value?: string | null) => {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-IN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: "Asia/Kolkata",
+  }).format(date);
+};
+function StatusBadge({ status }: { status: string }) {
+  const option = STATUS_OPTIONS.find((item) => item.value === status);
+  return (
+    <span
+      className={`inline-flex rounded-full border px-2.5 py-0.5 text-xs font-medium ${option?.color || "bg-muted"}`}
+    >
+      {option?.label || status}
+    </span>
+  );
+}
+function Assignees({
+  assignments,
+  fallback,
+}: {
+  assignments?: Assignment[];
+  fallback?: string | null;
+}) {
+  const names = assignments?.map((item) => item.employeeName) || [];
+  if (!names.length && fallback) names.push(fallback);
+  if (!names.length)
+    return (
+      <span className="text-xs italic text-muted-foreground">Unassigned</span>
+    );
+  return (
+    <div className="flex items-center gap-2">
+      <span className="flex h-7 w-7 items-center justify-center rounded-full bg-primary/10 text-[10px] font-bold text-primary">
+        {names[0].charAt(0)}
+      </span>
+      <div>
+        <div className="text-sm">{names[0]}</div>
+        {names.length > 1 && (
+          <div className="text-[11px] text-muted-foreground">
+            +{names.length - 1} more
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function Tasks() {
+  const queryClient = useQueryClient();
+  const { user, can } = useAuth();
+  const { data: batches = [] } = useListBatches();
+  const [filter, setFilter] = useState("all");
+  const [taskPage, setTaskPage] = useState(1);
+  const [taskPageSize, setTaskPageSize] = useState(15);
+  const statusFilter =
+    filter === "start"
+      ? "in_progress"
+      : filter === "pause"
+        ? "paused"
+        : filter === "complete"
+          ? "done"
+          : "";
+  const taskQuery = useQuery({
+    queryKey: ["tasks", "paged", filter, taskPage, taskPageSize],
+    queryFn: () => {
+      const params = new URLSearchParams({
+        skip: String((taskPage - 1) * taskPageSize),
+        limit: String(taskPageSize),
+      });
+      if (statusFilter) params.set("status", statusFilter);
+      return api<{ data: TaskRow[]; totalCount: number; totalPages: number }>(
+        `/tasks?${params}`,
+      );
+    },
+    placeholderData: keepPreviousData,
+  });
+  const tasks = taskQuery.data?.data ?? [];
+  const isLoading = taskQuery.isLoading || taskQuery.isFetching;
+  const { data: crew = [] } = useQuery({
+    queryKey: ["task-crew"],
+    queryFn: () => api<Crew[]>("/tasks/crew"),
+  });
+  const { data: timesheet, refetch: refetchTimesheet } = useQuery({
+    queryKey: ["task-timesheet"],
+    queryFn: () => api<Timesheet>("/tasks/timesheet"),
+    enabled: can("task.time_logs.view"),
+  });
+  const [tab, setTab] = useState<"tasks" | "timesheet">("tasks");
+  const [form, setForm] = useState(emptyForm);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editTask, setEditTask] = useState<TaskRow | null>(null);
+  const [assignTask, setAssignTask] = useState<TaskRow | null>(null);
+  const [selectedCrew, setSelectedCrew] = useState<number[]>([]);
+  const [assignBatchRef, setAssignBatchRef] = useState("");
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manual, setManual] = useState({
+    entryId: null as number | null,
+    source: "manual",
+    taskId: "",
+    date: new Date().toISOString().slice(0, 10),
+    startTime: "08:00",
+    endTime: "09:00",
+    notes: "",
+  });
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [, setClockTick] = useState(0);
+
+  useEffect(() => {
+    const interval = window.setInterval(
+      () => setClockTick((value) => value + 1),
+      1000,
+    );
+    return () => window.clearInterval(interval);
+  }, []);
+  const refresh = async () => {
+    await queryClient.invalidateQueries({
+      predicate: (query) => JSON.stringify(query.queryKey).includes("tasks"),
+    });
+    if (can("task.time_logs.view")) await refetchTimesheet();
+  };
+  const createTask = useCreateTask({
+    mutation: {
+      onSuccess: async () => {
+        setCreateOpen(false);
+        setForm(emptyForm);
+        toast.success("Task created");
+        await refresh();
+      },
+      onError: (error: any) => toast.error(error.message),
+    },
+  });
+  const updateTask = useUpdateTask({
+    mutation: {
+      onSuccess: async () => {
+        setEditTask(null);
+        setForm(emptyForm);
+        toast.success("Task updated");
+        await refresh();
+      },
+      onError: (error: any) => toast.error(error.message),
+    },
+  });
+  const deleteTask = useDeleteTask({
+    mutation: {
+      onSuccess: async () => {
+        toast.success("Task deleted");
+        await refresh();
+      },
+      onError: (error: any) => toast.error(error.message),
+    },
+  });
+
+  const filtered = tasks;
+  const myTasks = tasks.filter(
+    (task) =>
+      task.assignments?.some(
+        (item) => Number(item.userId) === Number(user?.id),
+      ) && task.status !== "cancelled",
+  );
+  const ownEmployee = crew.find((member) => Number(member.userId) === Number(user?.id));
+  const elapsedMinutes = (task: TaskRow) =>
+    Number(task.actualMinutes || 0) +
+    (task.activeTimers || []).reduce(
+      (sum: number, timer: any) =>
+        sum +
+        Math.max(0, (Date.now() - new Date(timer.startedAt).getTime()) / 60000),
+      0,
+    );
+  const isMine = (task: TaskRow) =>
+    task.assignments?.some((item) => Number(item.userId) === Number(user?.id));
+
+  const isRunning = (task: TaskRow) =>
+    task.activeTimers?.some(
+      (timer: any) => Number(timer.userId) === Number(user?.id),
+    );
+
+  async function operate(
+    task: TaskRow,
+    action: "start" | "pause" | "complete",
+  ) {
+    setBusyAction(`${task.id}:${action}`);
+    try {
+      await api(`/tasks/${task.id}/time-logs/${action}`, { method: "POST" });
+      toast.success(
+        action === "start"
+          ? "Task started"
+          : action === "pause"
+            ? "Task paused"
+            : "Task completed",
+      );
+      await refresh();
+    } catch (error: any) {
+      toast.error(error.message);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function saveAssignments() {
+    if (!assignTask) return;
+    setBusyAction(`assign:${assignTask.id}`);
+    try {
+      await api(`/tasks/${assignTask.id}/assignments`, {
+        method: "PATCH",
+        body: JSON.stringify({ employeeIds: selectedCrew }),
+      });
+      toast.success("Crew assignment updated");
+      setAssignTask(null);
+      await refresh();
+    } catch (error: any) {
+      toast.error(error.message);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+  async function saveManual(event: React.FormEvent): Promise<void> {
+    event.preventDefault();
+    setBusyAction("manual");
+    try {
+      await api(manual.entryId ? `/tasks/timesheet/${manual.entryId}` : "/tasks/timesheet", {
+        method: manual.entryId ? "PATCH" : "POST",
+        body: JSON.stringify({
+          taskId: manual.taskId || null,
+          workDate: manual.date,
+          startTime: manual.startTime,
+          endTime: manual.endTime,
+          notes: manual.notes,
+        }),
+      });
+      toast.success(manual.entryId ? "Timesheet updated" : "Time logged");
+      setManualOpen(false);
+      setManual({
+        entryId: null,
+        source: "manual",
+        taskId: "",
+        date: new Date().toISOString().slice(0, 10),
+        startTime: "08:00",
+        endTime: "09:00",
+        notes: "",
+      });
+      await refresh();
+    } catch (error: any) {
+      toast.error(error.message);
+    } finally {
+      setBusyAction(null);
+    }
+  }
+  function submitTask(event: React.FormEvent, editing = false) {
+    event.preventDefault();
+    const data = {
+      title: form.title,
+      description: form.description || null,
+      batchRef: form.batchRef || null,
+      priority: form.priority,
+      estimatedMinutes: form.estimatedMinutes
+        ? Number(form.estimatedMinutes)
+        : null,
+      notes: form.notes || null,
+    };
+    if (editing && editTask) updateTask.mutate({ id: editTask.id, data });
+    else createTask.mutate({ data });
+  }
+  function openEdit(task: TaskRow) {
+    setEditTask(task);
+    setForm({
+      title: task.title,
+      description: task.description || "",
+      batchRef: task.batchRef || "",
+      priority: task.priority,
+      estimatedMinutes: task.estimatedMinutes
+        ? String(task.estimatedMinutes)
+        : "",
+      notes: task.notes || "",
+    });
+  }
+  function openAssign(task: TaskRow) {
+    setAssignTask(task);
+    setSelectedCrew(
+      task.assignments?.map((item) => Number(item.employeeId)) || [],
+    );
+  }
+
+  const renderTaskForm = (editing = false) => (
+    <form
+      onSubmit={(event) => submitTask(event, editing)}
+      className="space-y-4 pt-2"
+    >
+      <div className="space-y-2">
+        <Label>Task name</Label>
+        <Input
+          required
+          value={form.title}
+          onChange={(event) => setForm({ ...form, title: event.target.value })}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label>Description</Label>
+        <Textarea
+          value={form.description}
+          onChange={(event) =>
+            setForm({ ...form, description: event.target.value })
+          }
+        />
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label>Work order / batch</Label>
+          <Select
+            value={form.batchRef}
+            onValueChange={(batchRef) => setForm({ ...form, batchRef })}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder="Link to batch" />
+            </SelectTrigger>
+            <SelectContent>
+              {(batches as any[]).map((batch: any) => (
+                <SelectItem key={batch.id} value={batch.batchCode}>
+                  {batch.batchCode}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-2">
+          <Label>Priority</Label>
+          <Select
+            value={form.priority}
+            onValueChange={(priority) => setForm({ ...form, priority })}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {PRIORITIES.map((priority) => (
+                <SelectItem key={priority} value={priority}>
+                  {priority[0].toUpperCase() + priority.slice(1)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+      <div className="space-y-2">
+        <Label>Estimated minutes</Label>
+        <Input
+          type="number"
+          min="0"
+          value={form.estimatedMinutes}
+          onChange={(event) =>
+            setForm({ ...form, estimatedMinutes: event.target.value })
+          }
+        />
+      </div>
+      <DialogFooter>
+        <Button
+          type="submit"
+          disabled={createTask.isPending || updateTask.isPending}
+        >
+          {editing ? "Save changes" : "Create task"}
+        </Button>
+      </DialogFooter>
+    </form>
+  );
+
+  return (
+    <Shell>
+      <div className="min-w-0 w-full space-y-6 p-4 sm:p-6 md:p-8">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <CheckSquare className="h-6 w-6 text-primary" />
+            <div>
+              <h1 className="font-display text-2xl font-bold tracking-tight">
+                Task management
+              </h1>
+            </div>
+          </div>
+          <div className="flex w-full gap-2 sm:w-auto [&>button]:w-full sm:[&>button]:w-auto">
+            {tab === "tasks" ? (
+              <Button
+                disabled={!can("task.task_board.create")}
+                onClick={() => {
+                  setForm(emptyForm);
+                  setCreateOpen(true);
+                }}
+              >
+                <Plus className="mr-2 h-4 w-4" />
+                New task
+              </Button>
+            ) : (
+              <Button
+                onClick={() => { setManual({ entryId: null, source: "manual", taskId: "", date: new Date().toISOString().slice(0, 10), startTime: "08:00", endTime: "09:00", notes: "" }); setManualOpen(true); }}
+                disabled={!can("task.time_logs.create") || !ownEmployee}
+              >
+                <Plus className="mr-2 h-4 w-4" />
+                Log time
+              </Button>
+            )}
+          </div>
+        </div>
+        <div className="flex w-full overflow-x-auto rounded-lg border bg-muted/40 p-1 sm:w-fit">
+          <Button
+            size="sm"
+            variant={tab === "tasks" ? "default" : "ghost"}
+            onClick={() => setTab("tasks")}
+          >
+            <CheckSquare className="mr-2 h-4 w-4" />
+            Tasks
+          </Button>
+          {can("task.time_logs.view") && (
+            <Button
+              size="sm"
+              variant={tab === "timesheet" ? "default" : "ghost"}
+              onClick={() => setTab("timesheet")}
+            >
+              <ClipboardList className="mr-2 h-4 w-4" />
+              Timesheet
+            </Button>
+          )}
+        </div>
+
+        {tab === "tasks" ? (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="mr-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Filter
+              </span>
+              {FILTER_OPTIONS.map((item) => (
+                <button
+                  key={item.value}
+                  onClick={() => {
+                    setFilter(item.value);
+                    setTaskPage(1);
+                  }}
+                  className={`rounded-full border px-3.5 py-1.5 text-xs font-medium ${filter === item.value ? "border-primary bg-primary text-primary-foreground" : "bg-white text-muted-foreground hover:border-primary/50"}`}
+                >
+                  {item.label}
+                </button>
+              ))}
+              <span className="ml-auto font-mono text-xs text-muted-foreground">
+                {Number(taskQuery.data?.totalCount || 0)} task
+                {Number(taskQuery.data?.totalCount || 0) === 1 ? "" : "s"}
+              </span>
+            </div>
+            <Card className="overflow-hidden rounded-xl border-border/60 shadow-sm">
+              <CardContent className="p-0">
+                {false ? (
+                  <div className="py-20 text-center text-sm text-muted-foreground">
+                    Loading tasks—
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm">
+                      <thead className="border-b bg-muted/50 text-xs uppercase tracking-wider text-muted-foreground">
+                        <tr>
+                          <th className="px-4 py-3.5">Task</th>
+                          <th className="px-4 py-3.5">Assigned crew</th>
+                          <th className="px-4 py-3.5">Work order</th>
+                          <th className="px-4 py-3.5">Status</th>
+                          <th className="px-4 py-3.5">Priority</th>
+                          <th className="px-4 py-3.5">Start time</th>
+                          <th className="px-4 py-3.5">End / pause time</th>
+                          <th className="px-4 py-3.5">Duration</th>
+                          <th className="w-10 px-4 py-3.5">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y">
+                        {isLoading && !filtered.length ? (
+                          <tr>
+                            <td
+                              colSpan={7}
+                              className="py-16 text-center text-muted-foreground"
+                            >
+                              Loading tasks...
+                            </td>
+                          </tr>
+                        ) : filtered.length ? (
+                          filtered.map((task) => (
+                            <tr key={task.id} className="hover:bg-muted/30">
+                              <td className="max-w-[280px] px-4 py-3.5">
+                                <div className="truncate font-medium">
+                                  {task.title}
+                                </div>
+                                <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                                  {task.description || "No description"}
+                                </div>
+                              </td>
+                              <td className="px-4 py-3.5">
+                                <Assignees
+                                  assignments={task.assignments}
+                                  fallback={task.assigneeName}
+                                />
+                              </td>
+                              <td className="px-4 py-3.5">
+                                <span className="rounded-md border bg-muted px-2 py-0.5 font-mono text-xs">
+                                  {task.batchRef || "—"}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3.5">
+                                <StatusBadge status={task.status} />
+                              </td>
+                              <td className="px-4 py-3.5 capitalize text-muted-foreground">
+                                {task.priority}
+                              </td>
+                              <td className="whitespace-nowrap px-4 py-3.5 text-xs text-muted-foreground">
+                                {formatDateTime(task.latestStartedAt)}
+                              </td>
+                              <td className="whitespace-nowrap px-4 py-3.5 text-xs text-muted-foreground">
+                                {task.latestTimerStatus === "active"
+                                  ? "Still running"
+                                  : formatDateTime(task.latestEndedAt)}
+                              </td>
+                              <td className="whitespace-nowrap px-4 py-3.5 font-mono text-xs text-muted-foreground">
+                                <span className="inline-flex items-center gap-2">
+                                  <Clock3 className="h-3.5 w-3.5" />
+                                  {formatMinutes(elapsedMinutes(task))}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3.5">
+                                <DropdownMenu>
+                                  <DropdownMenuTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      className="h-8 w-8"
+                                    >
+                                      <MoreVertical className="h-4 w-4" />
+                                    </Button>
+                                  </DropdownMenuTrigger>
+                                  <DropdownMenuContent align="end">
+                                    <DropdownMenuItem
+                                      disabled={!can("task.task_board.update")}
+                                      onClick={() => openEdit(task)}
+                                    >
+                                      <Pencil className="mr-2 h-4 w-4" />
+                                      Edit details
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      disabled={!can("task.task_board.update")}
+                                      onClick={() => openAssign(task)}
+                                    >
+                                      <UserRoundPlus className="mr-2 h-4 w-4" />
+                                      Assign crew
+                                    </DropdownMenuItem>
+                                    <DropdownMenuSeparator />
+                                    {isMine(task) &&
+                                      !isRunning(task) &&
+                                      ["todo", "paused"].includes(
+                                        task.status,
+                                      ) && (
+                                        <DropdownMenuItem
+                                          disabled={!!busyAction}
+                                          onClick={() => operate(task, "start")}
+                                        >
+                                          <Play className="mr-2 h-4 w-4" />{" "}
+                                          Start
+                                        </DropdownMenuItem>
+                                      )}
+                                    {isMine(task) && isRunning(task) && (
+                                      <DropdownMenuItem
+                                        disabled={!!busyAction}
+                                        onClick={() => operate(task, "pause")}
+                                      >
+                                        <Pause className="mr-2 h-4 w-4" /> Pause
+                                      </DropdownMenuItem>
+                                    )}
+                                    {isMine(task) &&
+                                      !["done", "cancelled"].includes(
+                                        task.status,
+                                      ) && (
+                                        <DropdownMenuItem
+                                          disabled={!!busyAction}
+                                          onClick={() =>
+                                            operate(task, "complete")
+                                          }
+                                        >
+                                          <SquareCheckBig className="mr-2 h-4 w-4" />
+                                          Complete
+                                        </DropdownMenuItem>
+                                      )}
+                                    {can("task.time_logs.view") && (
+                                      <DropdownMenuItem
+                                        onClick={() => setTab("timesheet")}
+                                      >
+                                        <ClipboardList className="mr-2 h-4 w-4" />
+                                        View timesheet
+                                      </DropdownMenuItem>
+                                    )}
+                                    {can("task.task_board.delete") && (
+                                      <>
+                                        <DropdownMenuSeparator />
+                                        <DropdownMenuItem
+                                          className="text-destructive"
+                                          onClick={() => {
+                                            if (confirm("Delete this task?"))
+                                              deleteTask.mutate({
+                                                id: task.id,
+                                              });
+                                          }}
+                                        >
+                                          <Trash2 className="mr-2 h-4 w-4" />
+                                          Delete
+                                        </DropdownMenuItem>
+                                      </>
+                                    )}
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
+                              </td>
+                            </tr>
+                          ))
+                        ) : (
+                          <tr>
+                            <td
+                              colSpan={7}
+                              className="py-16 text-center text-muted-foreground"
+                            >
+                              No tasks match the current filter.
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </CardContent>
+              <DataPagination
+                currentPage={taskPage}
+                pageSize={taskPageSize}
+                totalCount={Number(taskQuery.data?.totalCount || 0)}
+                totalPages={Number(taskQuery.data?.totalPages || 0)}
+                onPageChange={setTaskPage}
+                onPageSizeChange={(size) => {
+                  setTaskPageSize(size);
+                  setTaskPage(1);
+                }}
+                loading={isLoading}
+              />
+            </Card>
+          </>
+        ) : (
+          <TimesheetPanel data={timesheet} onEdit={(entry) => { setManual({ entryId: Number(entry.id), source: entry.source, taskId: entry.taskId ? String(entry.taskId) : "", date: entry.workDate, startTime: new Date(entry.startTime).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }), endTime: entry.endTime ? new Date(entry.endTime).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }) : "09:00", notes: entry.notes || "" }); setManualOpen(true); }} onDelete={async (entry) => { try { await api(`/tasks/timesheet/${entry.id}`, { method: "DELETE" }); toast.success("Timesheet entry removed"); await refresh(); } catch (error: any) { toast.error(error.message); } }} />
+        )}
+
+        <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>New task</DialogTitle>
+            </DialogHeader>
+            {renderTaskForm()}
+          </DialogContent>
+        </Dialog>
+        <Dialog
+          open={!!editTask}
+          onOpenChange={(open) => !open && setEditTask(null)}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Edit task</DialogTitle>
+            </DialogHeader>
+            {renderTaskForm(true)}
+          </DialogContent>
+        </Dialog>
+        <Dialog
+          open={!!assignTask}
+          onOpenChange={(open) => !open && setAssignTask(null)}
+        >
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>Assign crew & batch</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-2 py-2">
+              <Label>Batch mapping</Label>
+              <Select value={assignBatchRef} onValueChange={setAssignBatchRef}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Link to batch" />
+                </SelectTrigger>
+                <SelectContent>
+                  {(batches as any[]).map((batch: any) => (
+                    <SelectItem key={batch.id} value={batch.batchCode}>
+                      {batch.batchCode}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>Crew members</Label>
+              <div className="max-h-72 space-y-2 overflow-y-auto">
+                {crew.map((member) => (
+                  <label
+                    key={member.id}
+                    className="flex cursor-pointer items-center gap-3 rounded-lg border p-3 hover:bg-muted/40"
+                  >
+                    <Checkbox
+                      checked={selectedCrew.includes(member.id)}
+                      onCheckedChange={(checked) =>
+                        setSelectedCrew(
+                          checked
+                            ? [...selectedCrew, member.id]
+                            : selectedCrew.filter((id) => id !== member.id),
+                        )
+                      }
+                    />
+                    <div>
+                      <div className="font-medium">{member.name}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {member.employeeCode}
+                        {member.designation ? ` — ${member.designation}` : ""}
+                        {!member.userId ? " — No app login" : ""}
+                      </div>
+                    </div>
+                  </label>
+                ))}
+                {!crew.length && (
+                  <p className="py-8 text-center text-sm text-muted-foreground">
+                    No active crew members found.
+                  </p>
+                )}
+              </div>
+            </div>
+            <DialogFooter>
+              <Button
+                onClick={saveAssignments}
+                disabled={busyAction?.startsWith("assign")}
+              >
+                Save assignment
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+        <Dialog open={manualOpen} onOpenChange={setManualOpen}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>{manual.entryId ? "Edit time" : "Log time"}</DialogTitle>
+            </DialogHeader>
+            <form onSubmit={saveManual} className="space-y-4">
+              <div className="space-y-2">
+                <Label>Employee</Label>
+                <Input value={ownEmployee ? `${ownEmployee.name} — ${ownEmployee.employeeCode}` : "Employee account not linked"} disabled />
+              </div>
+              <div className="space-y-2">
+                <Label>Task (optional)</Label>
+                <Select
+                  value={manual.taskId || "__none"}
+                  onValueChange={(taskId) => setManual({ ...manual, taskId: taskId === "__none" ? "" : taskId })}
+                  disabled={manual.source !== "manual"}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="Select a task" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none">No task</SelectItem>
+                    {myTasks.map((task) => (
+                      <SelectItem key={task.id} value={String(task.id)}>
+                        {task.title}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Date</Label>
+                <Input
+                  type="date"
+                  required
+                  disabled={manual.source !== "manual"}
+                  value={manual.date}
+                  onChange={(event) =>
+                    setManual({ ...manual, date: event.target.value })
+                  }
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label>Start time</Label>
+                  <Input
+                    type="time"
+                    value={manual.startTime}
+                    disabled={manual.source !== "manual"}
+                    onChange={(event) =>
+                      setManual({ ...manual, startTime: event.target.value })
+                    }
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>End time</Label>
+                  <Input
+                    type="time"
+                    value={manual.endTime}
+                    disabled={manual.source !== "manual"}
+                    onChange={(event) =>
+                      setManual({ ...manual, endTime: event.target.value })
+                    }
+                  />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label>Notes (optional)</Label>
+                <Textarea
+                  value={manual.notes}
+                  onChange={(event) =>
+                    setManual({ ...manual, notes: event.target.value })
+                  }
+                  placeholder="What did you work on?"
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Default hours are 08:00–09:00. You may use any time of day. Editing a manual entry shifts all later manual entries for the same date; automatic task time only allows notes changes.
+              </p>
+              <DialogFooter>
+                <Button type="submit" disabled={busyAction === "manual"}>
+                  Save time
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      </div>
+    </Shell>
+  );
+}
+
+function TimesheetPanel({ data, onEdit, onDelete }: { data?: Timesheet; onEdit: (entry: any) => void; onDelete: (entry: any) => void }) {
+  const entries = data?.entries || [];
+  const dateGroups = Object.entries(
+    entries.reduce((groups: Record<string, any[]>, entry: any) => {
+      (groups[entry.workDate] ||= []).push(entry);
+      return groups;
+    }, {}),
+  ).sort(([a], [b]) => b.localeCompare(a));
+  const pagination = useClientPagination(dateGroups);
+  const [collapsedDates, setCollapsedDates] = useState<Set<string>>(new Set());
+  const [collapsedEmployees, setCollapsedEmployees] = useState<Set<string>>(new Set());
+  const today = new Date().toISOString().slice(0, 10);
+  const taskCount = Object.keys(data?.totals.tasks || {}).length;
+  return (
+    <div className="space-y-5">
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Summary
+          label="Today"
+          value={formatMinutes(data?.totals.daily?.[today] || 0)}
+        />
+        <Summary
+          label="Employee total"
+          value={formatMinutes(data?.totals.employeeMinutes || 0)}
+        />
+        <Summary label="Tasks logged" value={String(taskCount)} />
+      </div>
+      <Card className="overflow-hidden">
+        <CardContent className="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b bg-muted/50 text-xs uppercase tracking-wider text-muted-foreground">
+                <tr>
+                  <th className="px-4 py-3">Employee / Date</th>
+                  <th className="px-4 py-3">Task</th>
+                  <th className="px-4 py-3">Work order</th>
+                  <th className="px-4 py-3">From Time</th>
+                  <th className="px-4 py-3">To Time</th>
+                  <th className="px-4 py-3">Duration</th>
+                  <th className="px-4 py-3">Result</th>
+                  <th className="px-4 py-3">Notes</th>
+                  <th className="px-4 py-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {pagination.paginatedRows.flatMap(([workDate, dateEntries]: [string, any[]]) => {
+                  const dateCollapsed = collapsedDates.has(workDate);
+                  const employees = Object.entries(
+                    dateEntries.reduce((groups: Record<string, any[]>, entry: any) => {
+                      const key = String(entry.employeeId);
+                      (groups[key] ||= []).push(entry);
+                      return groups;
+                    }, {}),
+                  ).sort(([, a]: any, [, b]: any) => String(a[0]?.employeeName).localeCompare(String(b[0]?.employeeName)));
+                  const rows: React.ReactNode[] = [
+                    <tr key={`date-${workDate}`} className="border-t bg-muted/50">
+                      <td colSpan={9} className="p-0">
+                        <button type="button" className="flex w-full items-center gap-2 px-4 py-3 text-left font-semibold" onClick={() => setCollapsedDates((current) => { const next = new Set(current); next.has(workDate) ? next.delete(workDate) : next.add(workDate); return next; })}>
+                          {dateCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                          {workDate}
+                          <span className="text-xs font-normal text-muted-foreground">({dateEntries.length} {dateEntries.length === 1 ? "entry" : "entries"})</span>
+                        </button>
+                      </td>
+                    </tr>,
+                  ];
+                  if (dateCollapsed) return rows;
+                  for (const [employeeId, employeeEntries] of employees as [string, any[]][]) {
+                    const employeeKey = `${workDate}:${employeeId}`;
+                    const employeeCollapsed = collapsedEmployees.has(employeeKey);
+                    const employee = employeeEntries[0];
+                    rows.push(
+                      <tr key={`employee-${employeeKey}`} className="bg-muted/20">
+                        <td colSpan={9} className="p-0">
+                          <button type="button" className="flex w-full items-center gap-2 py-2 pl-8 pr-4 text-left font-medium" onClick={() => setCollapsedEmployees((current) => { const next = new Set(current); next.has(employeeKey) ? next.delete(employeeKey) : next.add(employeeKey); return next; })}>
+                            {employeeCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                            {employee.employeeName} — {employee.employeeCode || employee.employeeId}
+                          </button>
+                        </td>
+                      </tr>,
+                    );
+                    if (employeeCollapsed) continue;
+                    for (const entry of [...employeeEntries].sort((a, b) => String(a.startTime).localeCompare(String(b.startTime)))) rows.push(
+                  <tr key={entry.id}>
+                    <td className="px-4 py-3 pl-12 text-xs text-muted-foreground">{entry.source === "manual" ? "Manual entry" : "Task timer"}</td>
+                    <td className="px-4 py-3 font-medium">{entry.taskTitle}</td>
+                    <td className="px-4 py-3 font-mono text-xs">
+                      {entry.workOrder || "—"}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 text-xs">
+                      {formatTimesheetTime(entry.startTime)}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 text-xs">
+                      {formatTimesheetTime(entry.endTime)}
+                    </td>
+                    <td className="px-4 py-3 font-mono">
+                      {formatMinutes(entryDurationMinutes(entry))}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className="whitespace-nowrap rounded-full border px-2 py-0.5 text-xs capitalize">
+                        {entry.source === "manual"
+                          ? "Manual"
+                          : entry.status === "active"
+                            ? "Running"
+                            : entry.status === "paused"
+                              ? "Paused"
+                              : "Stopped"}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-muted-foreground">
+                      {entry.notes || "—"}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 text-right">
+                      <Button size="sm" variant="ghost" disabled={entry.status === "active"} onClick={() => onEdit(entry)}><Pencil className="h-4 w-4" /></Button>
+                      {entry.source === "manual" && <Button size="sm" variant="ghost" className="text-destructive" onClick={() => onDelete(entry)}><Trash2 className="h-4 w-4" /></Button>}
+                    </td>
+                  </tr>,
+                    );
+                  }
+                  return rows;
+                })}
+                {!entries.length && (
+                  <tr>
+                    <td
+                      colSpan={9}
+                      className="py-16 text-center text-muted-foreground"
+                    >
+                      No time has been logged yet.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+        <DataPagination
+          currentPage={pagination.currentPage}
+          pageSize={pagination.pageSize}
+          totalCount={pagination.totalCount}
+          onPageChange={pagination.setCurrentPage}
+          onPageSizeChange={pagination.setPageSize}
+        />
+      </Card>
+    </div>
+  );
+}
+function Summary({ label, value }: { label: string; value: string }) {
+  return (
+    <Card>
+      <CardContent className="p-4">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          {label}
+        </div>
+        <div className="mt-1 font-mono text-2xl font-semibold">{value}</div>
+      </CardContent>
+    </Card>
+  );
+}
